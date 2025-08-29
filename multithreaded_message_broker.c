@@ -9,7 +9,7 @@
 #include <ctype.h>
 #include <alloca.h>
 #include <limits.h>
-
+ 
 // ------------------------------------------------------------
 // Utilities: time, sleep, random
 // ------------------------------------------------------------
@@ -33,6 +33,7 @@ static int rnd(int lo, int hi){ // inclusive range
 // ------------------------------------------------------------
 typedef struct Config {
     int seconds;            // runtime seconds
+    int prio_weights[3];  // Weights for [High, Medium, Low] priority
     int producers;          // number of producer threads
     int consumers;          // number of consumer threads
     int topics;             // number of dynamic topics
@@ -46,13 +47,16 @@ typedef struct Config {
 
 static void default_config(Config *c){
     c->seconds = 5;
+    c->prio_weights[0] = 1; // High priority weight
+    c->prio_weights[1] = 3; // Medium priority weight
+    c->prio_weights[2] = 6; // Low priority weight
     c->producers = 5;
     c->consumers = 5;
     c->topics = 3;
     c->bounded_enabled = 0;
     c->capacity = 0; // 0 => unbounded
     c->retention_enabled = 0;
-    c->ttl_ms = 0; // 0 => no TTL by default
+    c->ttl_ms = 500; // 0 => no TTL by default
     c->gc_interval_ms = 800;
     c->fanout_enabled = 0;
 }
@@ -61,6 +65,7 @@ static int parse_int(const char *s, int *out){
     char *end; long v = strtol(s, &end, 10);
     if (*s == '\0' || *end != '\0') return -1; *out = (int)v; return 0;
 }
+
 static int parse_long(const char *s, long *out){
     char *end; long v = strtol(s, &end, 10);
     if (*s == '\0' || *end != '\0') return -1; *out = v; return 0;
@@ -92,6 +97,12 @@ static void parse_args(Config *cfg, int argc, char **argv){
         } else if (!strncmp(argv[i], "--gc-interval", 13)){
             const char *p = strchr(argv[i], '='); if (p) parse_long(p+1, &cfg->gc_interval_ms);
             else if (i+1<argc) parse_long(argv[++i], &cfg->gc_interval_ms);
+        } else if (!strncmp(argv[i], "--prio-weights", 14)){
+            const char *p = strchr(argv[i], '=');
+            if (p) {
+                // Parse the string "2,5,3" into the three weights
+                sscanf(p+1, "%d,%d,%d", &cfg->prio_weights[0], &cfg->prio_weights[1], &cfg->prio_weights[2]);
+            }
         } else {
             fprintf(stderr, "Unknown arg: %s\n", argv[i]);
         }
@@ -112,6 +123,19 @@ typedef struct Message {
     char topic[32];         // source topic name for logging
     char payload[128];      // demonstration payload
 } Message;
+
+static int weighted_prio_choice(int weights[3]) {
+    int total_weight = weights[0] + weights[1] + weights[2];
+    int random_value = rnd(1, total_weight); // Get a number between 1 and total_weight
+
+    if (random_value <= weights[0]) {
+        return 0; // High
+    } else if (random_value <= weights[0] + weights[1]) {
+        return 1; // Medium
+    } else {
+        return 2; // Low
+    }
+}
 
 typedef struct Node { Message msg; struct Node *next; } Node;
 
@@ -207,15 +231,24 @@ typedef struct Topic {
     pthread_cond_t not_empty;
     pthread_cond_t not_full;
     int fanout;                 // when 1, dispatcher fans out to all subs
-    Consumer **subs; int sub_count; int sub_cap;
-    int *producer_ids; int producer_count; int producer_cap;
+
+    Consumer **subs;
+    int sub_count;
+    int sub_cap;
+
+    int *producer_ids; 
+    int producer_count; 
+    int producer_cap;
     struct Broker *broker;      // back-pointer to broker
 } Topic;
 
 struct Consumer {
-    int id; char name[32];
-    Topic **topics; int topic_count;      // topics this consumer is registered for
-    Queue personal_q;                      // dispatcher -> consumer (now priority queue)
+    int id; 
+    char name[32];
+    Topic **topics; 
+    int topic_count;                      // topics this consumer is registered for
+    Queue personal_q;                     // dispatcher -> consumer (now priority queue)
+    
     pthread_mutex_t c_mtx;
     pthread_cond_t c_not_empty;
     pthread_cond_t c_not_full;
@@ -317,9 +350,9 @@ static void topic_enqueue_workqueue(Topic *t, Message m){
     pthread_mutex_unlock(&t->mtx);
 }
 
-static void topic_publish(Topic *t, Message m){
-    topic_enqueue_workqueue(t, m);
-}
+// static void topic_publish(Topic *t, Message m){
+//     topic_enqueue_workqueue(t, m);
+// }
 
 static int topic_pop(Topic *t, Message *out){
     pthread_mutex_lock(&t->mtx);
@@ -359,7 +392,11 @@ static int consumer_pop_personal(Consumer *c, Message *out){
 typedef struct ConsumerArg { Broker *b; Consumer *c; } ConsumerArg;
 
 static void *consumer_thread(void *arg){
-    ConsumerArg *ca = (ConsumerArg*)arg; Broker *b = ca->b; Consumer *c = ca->c; free(ca);
+    ConsumerArg *ca = (ConsumerArg*)arg; 
+    Broker *b = ca->b; 
+    Consumer *c = ca->c; 
+    free(ca);
+
     while (!atomic_load(&b->stop)){
         Message m;
         int ok = consumer_pop_personal(c, &m);
@@ -403,14 +440,18 @@ static void *consumer_thread(void *arg){
 typedef struct ProducerArg { Broker *b; int id; Topic **topics; int topic_count; } ProducerArg;
 
 static void *producer_thread(void *arg){
-    ProducerArg *pa = (ProducerArg*)arg; Broker *b = pa->b; int pid = pa->id; 
-    Topic **my_topics = pa->topics; int my_topic_count = pa->topic_count;
+    ProducerArg *pa = (ProducerArg*)arg; 
+    Broker *b = pa->b; 
+    int pid = pa->id; 
+    Topic **my_topics = pa->topics; 
+    int my_topic_count = pa->topic_count;
     free(pa);
 
     while (!atomic_load(&b->stop)){
-        Message m; memset(&m, 0, sizeof(m));
+        Message m; 
+        memset(&m, 0, sizeof(m));
         m.id = atomic_fetch_add(&b->next_msg_id, 1);
-        m.priority = rnd(0, 2);
+        m.priority = weighted_prio_choice(b->cfg.prio_weights); // new
         if (m.priority == 0) m.est_ms = rnd(100, 200);
         else if (m.priority == 1) m.est_ms = rnd(200, 300);
         else m.est_ms = rnd(300, 400);
@@ -420,7 +461,7 @@ static void *producer_thread(void *arg){
 
         Topic *chosen_topic = my_topics[0];
         strncpy(m.topic, chosen_topic->name, sizeof(m.topic)-1);
-        topic_publish(chosen_topic, m);
+        topic_enqueue_workqueue(chosen_topic, m);
 
         printf("[Producer %d] produced TASK id=%d prio=%d est=%ldms deadline=%lld ttl=%ld to topic=%s\n",
                pid, m.id, m.priority, m.est_ms, (long long)m.deadline_ms, m.ttl_ms, chosen_topic->name);
@@ -436,7 +477,11 @@ static void *producer_thread(void *arg){
 typedef struct DispatcherArg { Broker *b; int topic_index; } DispatcherArg;
 
 static void *dispatcher_thread(void *arg){
-    DispatcherArg *da = (DispatcherArg*)arg; Broker *b = da->b; int t_idx = da->topic_index; free(da);
+    DispatcherArg *da = (DispatcherArg*)arg; 
+    Broker *b = da->b; 
+    int t_idx = da->topic_index; 
+    free(da);
+
     Topic *topic = &b->topics[t_idx];
 
     while (!atomic_load(&b->stop)){
@@ -495,7 +540,7 @@ static void *dispatcher_thread(void *arg){
                 relevant_load += chosen->load_by_prio[p];
             }
             long long predicted_finish = now + relevant_load + m.est_ms;
-            
+            // if it can not get done on time -> reject
             if (m.deadline_ms > 0 && predicted_finish > m.deadline_ms){
                 atomic_fetch_add(&b->rejected_count, 1);
                 atomic_fetch_add(&b->rejected_by_topic_prio[t_idx*3 + (m.priority%3)], 1);
@@ -503,7 +548,7 @@ static void *dispatcher_thread(void *arg){
                        topic->name, m.id, predicted_finish, (long long)m.deadline_ms);
                 continue;
             }
-
+            // else -> assigns to the chosen consumer
             pthread_mutex_lock(&chosen->c_mtx);
             if (b->cfg.bounded_enabled && chosen->personal_q.capacity > 0){
                 while (chosen->personal_q.total_size >= chosen->personal_q.capacity && !atomic_load(&b->stop)){
@@ -594,7 +639,10 @@ static void purge_topic_queues(Topic *t){
 }
 
 static void *gc_thread(void *arg){
-    GCArg *ga = (GCArg*)arg; Broker *b = ga->b; free(ga);
+    GCArg *ga = (GCArg*)arg; 
+    Broker *b = ga->b; 
+    free(ga);
+
     while (!atomic_load(&b->stop)){
         if (b->cfg.retention_enabled && b->cfg.ttl_ms > 0){
             for (int i=0;i<b->topic_count;i++) purge_topic_queues(&b->topics[i]);
@@ -713,11 +761,13 @@ static void *dashboard_thread(void *arg){
 // ------------------------------------------------------------
 static void consumer_init(Consumer *c, int id, const char *name, int personal_capacity){
     memset(c, 0, sizeof(*c));
-    c->id = id; strncpy(c->name, name, sizeof(c->name)-1); 
+    c->id = id; 
+    strncpy(c->name, name, sizeof(c->name)-1); 
     c->load_ms = 0; 
     memset(c->load_by_prio, 0, sizeof(c->load_by_prio));
     atomic_store(&c->done_count, 0);
-    c->topics = NULL; c->topic_count = 0;
+    c->topics = NULL; 
+    c->topic_count = 0;
     q_init(&c->personal_q, personal_capacity);
     pthread_mutex_init(&c->c_mtx, NULL);
     pthread_cond_init(&c->c_not_empty, NULL);
@@ -819,14 +869,18 @@ static void broker_start_threads(Broker *b){
 
     b->consumer_threads = (pthread_t*)calloc(b->cfg.consumers, sizeof(pthread_t));
     for (int i=0;i<b->cfg.consumers;i++){
-        ConsumerArg *ca = (ConsumerArg*)malloc(sizeof(ConsumerArg)); ca->b = b; ca->c = &b->consumers[i];
+        ConsumerArg *ca = (ConsumerArg*)malloc(sizeof(ConsumerArg)); 
+        ca->b = b; 
+        ca->c = &b->consumers[i];
         pthread_create(&b->consumer_threads[i], NULL, consumer_thread, ca);
     }
 
     // one dispatcher thread per topic
     b->dispatcher_threads = (pthread_t*)calloc(b->topic_count, sizeof(pthread_t));
     for (int t=0; t<b->topic_count; t++){
-        DispatcherArg *da = (DispatcherArg*)malloc(sizeof(DispatcherArg)); da->b = b; da->topic_index = t;
+        DispatcherArg *da = (DispatcherArg*)malloc(sizeof(DispatcherArg)); 
+        da->b = b; 
+        da->topic_index = t;
         pthread_create(&b->dispatcher_threads[t], NULL, dispatcher_thread, da);
     }
 
